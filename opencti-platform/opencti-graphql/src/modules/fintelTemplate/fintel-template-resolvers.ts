@@ -7,6 +7,7 @@ const fintelTemplateResolvers: Resolvers = {
   },
   FintelTemplate: {
     toConfigurationExport: (fintelTemplate, _, context) => fintelTemplateExport(context, context.user, fintelTemplate),
+    default: (fintelTemplate) => Boolean(fintelTemplate.default),
   },
   Mutation: {
     fintelTemplateAdd: (_, { input }, context) => {
