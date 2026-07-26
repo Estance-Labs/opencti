@@ -103,6 +103,15 @@ describe('Corrobore knowledge data provider', () => {
     }, fetch);
 
     await client.initialize();
+    const initializeBody = JSON.parse(fetch.mock.calls[2][1]?.body as string);
+    expect(initializeBody.request.context.access).toEqual({
+      subject_id: 'system',
+      organization_ids: [],
+      marking_ids: [],
+      tenant_id: null,
+      roles: ['system'],
+      attributes: {},
+    });
     await expect(client.read({ operation: 'get_by_id', request: { id: 'indicator--1' } }, {
       requestId: 'request--1', correlationId: 'correlation--1', access: { subject_id: 'system', roles: ['system'] },
     })).resolves.toEqual({

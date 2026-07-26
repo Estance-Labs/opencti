@@ -233,7 +233,14 @@ export class CorroboreProviderClient {
     } }, {
       requestId: 'opencti-provider-initialize',
       correlationId: 'opencti-provider-initialize',
-      access: { subject_id: 'system', roles: ['system'] },
+      access: {
+        subject_id: 'system',
+        organization_ids: [],
+        marking_ids: [],
+        tenant_id: null,
+        roles: ['system'],
+        attributes: {},
+      },
     });
     if (negotiation.response !== 'initialized') {
       throw new CorroboreProviderError('schema_incompatible', 'Corrobore did not return provider capabilities', false);
