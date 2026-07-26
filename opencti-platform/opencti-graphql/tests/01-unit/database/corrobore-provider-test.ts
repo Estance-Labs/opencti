@@ -225,4 +225,30 @@ describe('Corrobore knowledge data provider', () => {
       .resolves.toEqual({ ok: true });
     expect(fetch).toHaveBeenCalledTimes(2);
   });
+
+  it('retries bounded Corrobore write backpressure with the same idempotent payload', async () => {
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'write saturated' }), {
+        status: 503,
+        headers: { 'retry-after': '0' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(success('write', {
+        id: 'indicator--1', revision: 4,
+      })), { status: 200 }));
+    const client = new CorroboreProviderClient({
+      baseUrl: 'https://corrobore:8080', token: 'secret', timeoutMs: 1000,
+    }, fetch);
+    const context = {
+      requestId: 'request--2', correlationId: 'correlation--1', idempotencyKey: 'update--1',
+      access: { subject_id: 'system', roles: ['system'] },
+    };
+
+    await expect(client.write({ operation: 'update', request: {
+      id: 'indicator--1', expected_revision: 3, patch: { name: 'APT 2' },
+    } }, context)).resolves.toEqual({ response: 'write', data: { id: 'indicator--1', revision: 4 } });
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch.mock.calls[1][1]?.body).toBe(fetch.mock.calls[0][1]?.body);
+    expect(JSON.parse(fetch.mock.calls[1][1]?.body as string).context.idempotency_key).toBe('update--1');
+  });
 });

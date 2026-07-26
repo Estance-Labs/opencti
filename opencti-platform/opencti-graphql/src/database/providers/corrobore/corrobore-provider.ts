@@ -341,7 +341,7 @@ export class CorroboreProviderClient {
   private async request(path: string, method: 'GET' | 'POST', body?: unknown): Promise<unknown> {
     const controller = new AbortController();
     const startedAt = Date.now();
-    let rateLimitAttempt = 0;
+    let retryAttempt = 0;
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
     try {
       while (true) {
@@ -355,19 +355,24 @@ export class CorroboreProviderClient {
           body: body === undefined ? undefined : JSON.stringify(body),
           signal: controller.signal,
         });
-        if (response.status === 429) {
+        // Canonical writes carry a stable idempotency key, so Corrobore's
+        // explicit backpressure response can be retried without duplicating a
+        // committed mutation. Other POST endpoints remain fail-closed.
+        const retryableBackpressure = response.status === 503 && path === '/v1/opencti/writes';
+        if (response.status === 429 || retryableBackpressure) {
           const remainingMs = this.config.timeoutMs - (Date.now() - startedAt);
           if (remainingMs <= 0) {
-            throw new CorroboreProviderError('backend_unavailable', `Corrobore ${method} ${path} remained rate limited`, true);
+            const reason = response.status === 429 ? 'rate limited' : 'under write backpressure';
+            throw new CorroboreProviderError('backend_unavailable', `Corrobore ${method} ${path} remained ${reason}`, true);
           }
           const retryAfterSeconds = Number(response.headers.get('retry-after'));
           const backoffMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0
             ? retryAfterSeconds * 1000
-            : Math.min(50 * (2 ** Math.min(rateLimitAttempt, 5)), 1000);
+            : Math.min(50 * (2 ** Math.min(retryAttempt, 5)), 1000);
           await new Promise((resolve) => {
             setTimeout(resolve, Math.min(Math.max(backoffMs, 1), remainingMs));
           });
-          rateLimitAttempt += 1;
+          retryAttempt += 1;
           continue;
         }
         if (!response.ok) {
