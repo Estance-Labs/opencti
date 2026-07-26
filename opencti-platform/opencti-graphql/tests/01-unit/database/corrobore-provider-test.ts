@@ -82,6 +82,34 @@ describe('Corrobore knowledge data provider', () => {
     });
   });
 
+  it('preserves nested-object filter scope and ignores empty filter groups', () => {
+    expect(filterGroupToPredicate({
+      mode: FilterMode.And,
+      filters: [{
+        key: ['connections'],
+        values: [],
+        nested: [
+          { key: ['internal_id'], values: ['identity--1'], operator: FilterOperator.Eq },
+          { key: ['role'], values: ['*_from'], operator: FilterOperator.Wildcard },
+        ],
+      }],
+      filterGroups: [],
+    })).toEqual({
+      operator: 'nested',
+      arguments: {
+        path: 'connections',
+        predicate: {
+          operator: 'and',
+          arguments: [
+            { operator: 'condition', arguments: { field: 'internal_id', operator: 'equal', value: 'identity--1' } },
+            { operator: 'condition', arguments: { field: 'role', operator: 'wildcard', value: '*_from' } },
+          ],
+        },
+      },
+    });
+    expect(filterGroupToPredicate({ mode: FilterMode.And, filters: [], filterGroups: [] })).toBeNull();
+  });
+
   it('routes typed reads and writes and unwraps the stable response envelope', async () => {
     const fetch = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ ready: true }), { status: 200 }))

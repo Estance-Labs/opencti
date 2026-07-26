@@ -47,15 +47,21 @@ export type CorroboreRecordPage = {
   total_count: number | null;
 };
 
-type CorroborePredicate = {
-  operator: 'condition' | 'and' | 'or';
-  arguments: CorroboreCondition | CorroborePredicate[];
-};
+type CorroborePredicate
+  = | { operator: 'condition'; arguments: CorroboreCondition }
+    | { operator: 'and' | 'or'; arguments: CorroborePredicate[] }
+    | { operator: 'nested'; arguments: { path: string; predicate: CorroborePredicate } };
 
 type CorroboreCondition = {
   field: string;
   operator: string;
   value: unknown;
+};
+
+type CorroboreFilter = Filter & { nested?: CorroboreFilter[] };
+type CorroboreFilterGroup = Omit<FilterGroup, 'filters' | 'filterGroups'> & {
+  filters: CorroboreFilter[];
+  filterGroups: CorroboreFilterGroup[];
 };
 
 type CorroboreSuccess = {
@@ -141,7 +147,7 @@ export const accessContextFromUser = (user: Record<string, any>): CorroboreAcces
   };
 };
 
-const conditionOperator = (filter: Filter): string => {
+const conditionOperator = (filter: CorroboreFilter): string => {
   const multiple = filter.values.length > 1;
   switch (filter.operator ?? FilterOperator.Eq) {
     case FilterOperator.Eq: return multiple ? 'in' : 'equal';
@@ -152,28 +158,42 @@ const conditionOperator = (filter: Filter): string => {
     case FilterOperator.Gte: return 'greater_than_or_equal';
     case FilterOperator.Lt: return 'less_than';
     case FilterOperator.Lte: return 'less_than_or_equal';
+    case FilterOperator.Wildcard: return 'wildcard';
     default: throw new CorroboreProviderError('unsupported_capability', `Unsupported OpenCTI filter operator ${filter.operator}`, false);
   }
 };
 
-const filterToPredicate = (filter: Filter): CorroborePredicate => {
-  if (filter.key.length !== 1) {
+const filterToPredicate = (filter: CorroboreFilter): CorroborePredicate => {
+  const keys = Array.isArray(filter.key) ? filter.key : [filter.key];
+  if (keys.length !== 1 || typeof keys[0] !== 'string' || keys[0].length === 0) {
     throw new CorroboreProviderError('unsupported_capability', 'Corrobore requires one typed field per filter', false);
+  }
+  if (filter.nested && filter.nested.length > 0) {
+    const nested = filter.nested.map(filterToPredicate);
+    return {
+      operator: 'nested',
+      arguments: {
+        path: keys[0],
+        predicate: nested.length === 1 ? nested[0] : { operator: 'and', arguments: nested },
+      },
+    };
   }
   const operator = conditionOperator(filter);
   const value = operator === 'exists' || operator === 'not_exists'
     ? null
     : filter.values.length > 1 ? filter.values : filter.values[0];
-  return { operator: 'condition', arguments: { field: filter.key[0], operator, value } };
+  return { operator: 'condition', arguments: { field: keys[0], operator, value } };
 };
 
 /** Preserve the boolean structure of OpenCTI filters without exposing Query DSL. */
-export const filterGroupToPredicate = (filterGroup: FilterGroup | null | undefined): CorroborePredicate | null => {
+export const filterGroupToPredicate = (filterGroup: CorroboreFilterGroup | null | undefined): CorroborePredicate | null => {
   if (!filterGroup) return null;
   const argumentsList = [
     ...filterGroup.filters.map(filterToPredicate),
     ...filterGroup.filterGroups.map((group) => filterGroupToPredicate(group)).filter((predicate): predicate is CorroborePredicate => predicate !== null),
   ];
+  if (argumentsList.length === 0) return null;
+  if (argumentsList.length === 1) return argumentsList[0];
   return {
     operator: filterGroup.mode === FilterMode.Or ? 'or' : 'and',
     arguments: argumentsList,
@@ -332,7 +352,9 @@ export class CorroboreProviderClient {
           const backoffMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0
             ? retryAfterSeconds * 1000
             : Math.min(50 * (2 ** Math.min(rateLimitAttempt, 5)), 1000);
-          await new Promise((resolve) => { setTimeout(resolve, Math.min(Math.max(backoffMs, 1), remainingMs)); });
+          await new Promise((resolve) => {
+            setTimeout(resolve, Math.min(Math.max(backoffMs, 1), remainingMs));
+          });
           rateLimitAttempt += 1;
           continue;
         }
