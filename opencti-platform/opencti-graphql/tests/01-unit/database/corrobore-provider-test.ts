@@ -171,4 +171,20 @@ describe('Corrobore knowledge data provider', () => {
     } })).resolves.toMatchObject({ ok: true, result: 'enqueued' });
     expect(new URL(fetch.mock.calls[0][0] as string).pathname).toBe('/v1/opencti/files');
   });
+
+  it('retries bounded Corrobore rate limits within the request timeout', async () => {
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'rate limited' }), {
+        status: 429,
+        headers: { 'retry-after': '0' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    const client = new CorroboreProviderClient({
+      baseUrl: 'https://corrobore:8080', token: 'secret', timeoutMs: 1000,
+    }, fetch);
+
+    await expect(client.fileCommand({ operation: 'delete', file_id: 'import/test.txt' }))
+      .resolves.toEqual({ ok: true });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
 });

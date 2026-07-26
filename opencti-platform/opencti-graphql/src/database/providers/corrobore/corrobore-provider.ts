@@ -308,22 +308,39 @@ export class CorroboreProviderClient {
 
   private async request(path: string, method: 'GET' | 'POST', body?: unknown): Promise<unknown> {
     const controller = new AbortController();
+    const startedAt = Date.now();
+    let rateLimitAttempt = 0;
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
     try {
-      const response = await this.fetchImplementation(`${this.config.baseUrl}${path}`, {
-        method,
-        headers: {
-          authorization: `Bearer ${required(this.token, 'Corrobore authentication token')}`,
-          accept: 'application/json',
-          ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-        },
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal: controller.signal,
-      });
-      if (!response.ok) {
-        throw new CorroboreProviderError('backend_unavailable', `Corrobore ${method} ${path} failed with HTTP ${response.status}`, response.status >= 500);
+      while (true) {
+        const response = await this.fetchImplementation(`${this.config.baseUrl}${path}`, {
+          method,
+          headers: {
+            authorization: `Bearer ${required(this.token, 'Corrobore authentication token')}`,
+            accept: 'application/json',
+            ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+          },
+          body: body === undefined ? undefined : JSON.stringify(body),
+          signal: controller.signal,
+        });
+        if (response.status === 429) {
+          const remainingMs = this.config.timeoutMs - (Date.now() - startedAt);
+          if (remainingMs <= 0) {
+            throw new CorroboreProviderError('backend_unavailable', `Corrobore ${method} ${path} remained rate limited`, true);
+          }
+          const retryAfterSeconds = Number(response.headers.get('retry-after'));
+          const backoffMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0
+            ? retryAfterSeconds * 1000
+            : Math.min(50 * (2 ** Math.min(rateLimitAttempt, 5)), 1000);
+          await new Promise((resolve) => { setTimeout(resolve, Math.min(Math.max(backoffMs, 1), remainingMs)); });
+          rateLimitAttempt += 1;
+          continue;
+        }
+        if (!response.ok) {
+          throw new CorroboreProviderError('backend_unavailable', `Corrobore ${method} ${path} failed with HTTP ${response.status}`, response.status >= 500);
+        }
+        return await response.json();
       }
-      return await response.json();
     } finally {
       clearTimeout(timeout);
     }
