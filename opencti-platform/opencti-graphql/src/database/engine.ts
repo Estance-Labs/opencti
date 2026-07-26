@@ -199,6 +199,7 @@ import { isEsScriptFilterEnabled } from './engine-config';
 import { AbortError } from 'node-fetch';
 import { createHash } from 'node:crypto';
 import {
+  corroboreIncludesRelationships,
   corroboreRead,
   corroboreProviderVersion,
   corroboreWrite,
@@ -315,11 +316,17 @@ const corroboreAggregate = async (
   options: QueryBodyBuilderOpts,
   aggregation: Record<string, unknown>,
 ) => {
+  const kinds = options.types == null ? [] : Array.isArray(options.types) ? options.types : [options.types];
+  const includeRelationships = corroboreIncludesRelationships(
+    computeQueryIndices(undefined, kinds),
+    READ_RELATIONSHIPS_INDICES,
+  );
   const response = await corroboreRead({ operation: 'aggregate', request: { plan: {
-    kinds: options.types ?? [],
+    kinds,
     predicate: filterGroupToPredicate(options.filters),
     aggregation,
     candidate_limit: 100000,
+    include_relationships: includeRelationships,
   } } }, context, user);
   if (response.response !== 'aggregation') throw DatabaseError(`Corrobore returned ${response.response} for aggregation`);
   return response.data;
@@ -3423,6 +3430,10 @@ export const elPaginate = async <T extends BasicStoreBase>(
   if (isCorroboreProviderConfigured()) {
     const first = Math.min(options.first ?? ES_DEFAULT_PAGINATION, ES_MAX_PAGINATION);
     const kinds = options.types == null ? [] : Array.isArray(options.types) ? options.types : [options.types];
+    const includeRelationships = corroboreIncludesRelationships(
+      computeQueryIndices(indexName, kinds),
+      READ_RELATIONSHIPS_INDICES,
+    );
     const predicate = filterGroupToPredicate(options.filters);
     const idPredicate = options.ids && options.ids.length > 0 ? {
       operator: 'condition',
@@ -3441,6 +3452,7 @@ export const elPaginate = async <T extends BasicStoreBase>(
       order_by: orderBy,
       limit: first,
       include_total_count: true,
+      include_relationships: includeRelationships,
     };
     let page: any;
     if (options.search) {
@@ -3691,11 +3703,18 @@ export const elCount = async (
 ): Promise<number> => {
   if (isCorroboreProviderConfigured()) {
     const typedOptions = options as QueryBodyBuilderOpts;
-    const kinds = typedOptions.types ?? [];
+    const kinds = typedOptions.types == null
+      ? []
+      : Array.isArray(typedOptions.types) ? typedOptions.types : [typedOptions.types];
+    const includeRelationships = corroboreIncludesRelationships(
+      computeQueryIndices(indexName, kinds),
+      READ_RELATIONSHIPS_INDICES,
+    );
     const response = await corroboreRead({ operation: 'count', request: {
       filter: {},
       kinds,
       filters: [],
+      include_relationships: includeRelationships,
       ...(typedOptions.filters ? { predicate: filterGroupToPredicate(typedOptions.filters) } : {}),
     } }, context, user);
     if (response.response !== 'count') throw DatabaseError(`Corrobore returned ${response.response} for count`);

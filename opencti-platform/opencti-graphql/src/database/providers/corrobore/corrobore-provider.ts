@@ -47,6 +47,18 @@ export type CorroboreRecordPage = {
   total_count: number | null;
 };
 
+/** Preserve the OpenCTI index scope when selecting graph records in Corrobore. */
+export const corroboreIncludesRelationships = (
+  queryIndices: string | string[] | undefined | null,
+  relationshipIndices: string[],
+): boolean => {
+  if (queryIndices == null) return false;
+  const requested = (Array.isArray(queryIndices) ? queryIndices : queryIndices.split(','))
+    .map((index) => index.trim())
+    .filter((index) => index.length > 0);
+  return relationshipIndices.some((relationshipIndex) => requested.includes(relationshipIndex));
+};
+
 type CorroborePredicate
   = | { operator: 'condition'; arguments: CorroboreCondition }
     | { operator: 'and' | 'or'; arguments: CorroborePredicate[] }

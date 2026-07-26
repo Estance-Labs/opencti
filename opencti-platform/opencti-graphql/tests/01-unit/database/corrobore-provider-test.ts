@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   CorroboreProviderClient,
   accessContextFromUser,
+  corroboreIncludesRelationships,
   filterGroupToPredicate,
   parseCorroboreConfig,
   recordPageToConnection,
@@ -15,6 +16,15 @@ const success = (response: string, data: unknown) => ({
 });
 
 describe('Corrobore knowledge data provider', () => {
+  it('preserves relationship index scope for graph reads', () => {
+    const relationships = ['opencti_stix_core_relationships*', 'opencti_stix_meta_relationships*'];
+    expect(corroboreIncludesRelationships(
+      ['opencti_stix_domain_objects*', 'opencti_stix_core_relationships*'],
+      relationships,
+    )).toBe(true);
+    expect(corroboreIncludesRelationships('opencti_stix_domain_objects*', relationships)).toBe(false);
+  });
+
   it('requires the explicit provider configuration and rejects Elastic variables', () => {
     expect(parseCorroboreConfig({
       DATABASE_ENGINE: 'corrobore',
