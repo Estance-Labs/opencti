@@ -197,6 +197,16 @@ import { getRoleAssumerWithWebIdentity } from '../utils/awsSdk';
 import { elConvertHits, elConvertHitsToMap, INNER_HITS_WINDOWS_SIZE } from './engine-data-converter';
 import { isEsScriptFilterEnabled } from './engine-config';
 import { AbortError } from 'node-fetch';
+import { createHash } from 'node:crypto';
+import {
+  corroboreRead,
+  corroboreProviderVersion,
+  corroboreWrite,
+  filterGroupToPredicate,
+  initializeCorroboreProvider,
+  isCorroboreProviderConfigured,
+  recordPageToConnection,
+} from './providers/corrobore/corrobore-provider';
 
 const ELK_ENGINE = 'elk';
 const OPENSEARCH_ENGINE = 'opensearch';
@@ -283,6 +293,37 @@ export const isImpactedRole = (type: string, fromType: string, toType: string, r
 export let engine: ElkClient | OpenClient;
 let isRuntimeSortingEnable = false;
 let attachmentProcessorEnabled = false;
+
+const corroboreIdempotencyKey = (operation: string, payload: unknown): string => {
+  const digest = createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+  return `opencti-${operation}-${digest}`;
+};
+
+const corroboreRecordBody = <T extends BasicStoreBase>(response: { response: string; data: any }): T | undefined => {
+  if (response.response !== 'record') throw DatabaseError(`Corrobore returned ${response.response} for a point read`);
+  return response.data?.body as T | undefined;
+};
+
+const corroboreRecordPage = (response: { response: string; data: any }) => {
+  if (response.response !== 'records') throw DatabaseError(`Corrobore returned ${response.response} for a record list`);
+  return response.data;
+};
+
+const corroboreAggregate = async (
+  context: AuthContext,
+  user: AuthUser,
+  options: QueryBodyBuilderOpts,
+  aggregation: Record<string, unknown>,
+) => {
+  const response = await corroboreRead({ operation: 'aggregate', request: { plan: {
+    kinds: options.types ?? [],
+    predicate: filterGroupToPredicate(options.filters),
+    aggregation,
+    candidate_limit: 100000,
+  } } }, context, user);
+  if (response.response !== 'aggregation') throw DatabaseError(`Corrobore returned ${response.response} for aggregation`);
+  return response.data;
+};
 
 export const isAttachmentProcessorEnabled = () => {
   return attachmentProcessorEnabled;
@@ -392,6 +433,9 @@ export const elConfigureAttachmentProcessor = async (): Promise<boolean> => {
 
 // Look for the engine version with OpenSearch client
 export const searchEngineVersion = async () => {
+  if (isCorroboreProviderConfigured()) {
+    return { platform: 'corrobore', version: corroboreProviderVersion().version ?? '1.0' } as const;
+  }
   try {
     const { version: { distribution, number }, tagline } = oebp(await (engine as OpenClient).info());
     // Try to detect OpenSearch engine, based on https://github.com/opensearch-project/OpenSearch/blame/main/server/src/main/java/org/opensearch/action/main/MainResponse.java
@@ -406,6 +450,14 @@ export const searchEngineVersion = async () => {
 };
 
 export const searchEngineInit = async (): Promise<boolean> => {
+  if (isCorroboreProviderConfigured()) {
+    logApp.info('[CHECK] Checking if Corrobore knowledge data engine is available');
+    const initialized = await initializeCorroboreProvider();
+    isRuntimeSortingEnable = false;
+    attachmentProcessorEnabled = false;
+    logApp.info('[SEARCH][CHECK] Corrobore knowledge data engine is alive in Elastic-free mode');
+    return initialized;
+  }
   logApp.info('[CHECK] Checking if Search engine is available');
   // Build the engine configuration
   const ca = conf.get('elasticsearch:ssl:ca')
@@ -636,6 +688,13 @@ export const elRawSearch = (context: AuthContext, user: AuthUser, types: string[
 };
 
 export const elRawGet = async (args: { id: string; index: string }) => {
+  if (isCorroboreProviderConfigured()) {
+    const context = executionContext('corrobore_raw_get');
+    const response = await corroboreRead({ operation: 'get_by_id', request: { id: args.id } }, context, SYSTEM_USER);
+    const body = corroboreRecordBody(response);
+    if (!body) throw DatabaseError('Corrobore record not found', { id: args.id });
+    return { _id: args.id, _index: args.index, _source: body, found: true };
+  }
   const rawGetOperation = async () => {
     if (engine instanceof ElkClient) {
       const r = await engine.get(args);
@@ -647,6 +706,17 @@ export const elRawGet = async (args: { id: string; index: string }) => {
   return retryElOperations(rawGetOperation);
 };
 export const elRawIndex = async (args: any) => {
+  if (isCorroboreProviderConfigured()) {
+    const context = executionContext('corrobore_raw_index');
+    const record = args.body ?? args.document;
+    const id = args.id ?? record?.internal_id ?? record?.id;
+    const existing = await corroboreRead({ operation: 'get_by_id', request: { id } }, context, SYSTEM_USER);
+    const operation = existing.data
+      ? { operation: 'update', request: { id, expected_revision: existing.data.revision, patch: record } }
+      : { operation: 'create', request: { record } };
+    const response = await corroboreWrite(operation, context, SYSTEM_USER, corroboreIdempotencyKey('raw-index', { id, record }));
+    return { _id: id, _index: args.index, result: existing.data ? 'updated' : 'created', _version: response.data?.revision };
+  }
   const rawIndexOperation = async () => {
     if (engine instanceof ElkClient) {
       const r = await engine.index(args);
@@ -658,6 +728,14 @@ export const elRawIndex = async (args: any) => {
   return retryElOperations(rawIndexOperation);
 };
 export const elRawDelete = async (args: any) => {
+  if (isCorroboreProviderConfigured()) {
+    const context = executionContext('corrobore_raw_delete');
+    const response = await corroboreWrite({ operation: 'delete', request: {
+      id: args.id,
+      expected_revision: null,
+    } }, context, SYSTEM_USER, corroboreIdempotencyKey('raw-delete', { id: args.id }));
+    return { _id: args.id, _index: args.index, result: 'deleted', _version: response.data?.revision };
+  }
   const rawDeleteOperation = async () => {
     if (engine instanceof ElkClient) {
       const r = await engine.delete(args);
@@ -680,6 +758,35 @@ export const elRawDeleteByQuery = async (query: any) => {
   return retryElOperations(rawDeleteOperation);
 };
 export const elRawBulk = async (context: AuthContext, args: any) => {
+  if (isCorroboreProviderConfigured()) {
+    const body = Array.isArray(args.body) ? args.body : [];
+    const operations = [];
+    for (let index = 0; index < body.length; index += 1) {
+      const action = body[index];
+      const [kind, metadata] = Object.entries(action)[0] as [string, any];
+      if (kind === 'delete') {
+        operations.push({ operation: 'delete', id: metadata._id, expected_revision: null });
+        continue;
+      }
+      const payload = body[index + 1];
+      index += 1;
+      if (kind === 'update') {
+        const patch = payload.doc ?? payload.script?.params ?? {};
+        operations.push({ operation: 'update', id: metadata._id, expected_revision: null, patch });
+        continue;
+      }
+      if (kind !== 'index' && kind !== 'create') {
+        throw UnsupportedError(`Corrobore does not support bulk action ${kind}`);
+      }
+      const existing = await corroboreRead({ operation: 'get_by_id', request: { id: metadata._id } }, context, context.user ?? SYSTEM_USER);
+      operations.push(existing.data
+        ? { operation: 'update', id: metadata._id, expected_revision: existing.data.revision, patch: payload }
+        : { operation: 'create', record: payload });
+    }
+    const response = await corroboreWrite({ operation: 'bulk', request: { operations, atomic: true } }, context, context.user ?? SYSTEM_USER,
+      corroboreIdempotencyKey('bulk', operations));
+    return { errors: false, items: response.data?.results ?? [] };
+  }
   const bulkOperation = async () => {
     return await elExecuteWithAbortSignal(
       context?.requestAbortSignal,
@@ -985,6 +1092,7 @@ export const buildDataRestrictions = async (
 };
 
 export const elIndexExists = async (indexName: string): Promise<boolean> => {
+  if (isCorroboreProviderConfigured()) return false;
   const indexExistsArg = { index: indexName };
   if (engine instanceof ElkClient) {
     return engine.indices.exists(indexExistsArg);
@@ -993,6 +1101,7 @@ export const elIndexExists = async (indexName: string): Promise<boolean> => {
   return oebp(existOpenSearchResult) === true || existOpenSearchResult.body === true;
 };
 export const elIndexGetAlias = async (indexName: string): Promise<any> => {
+  if (isCorroboreProviderConfigured()) return {};
   const args = { index: indexName };
   if (engine instanceof ElkClient) {
     const r = await engine.indices.getAlias(args);
@@ -1002,6 +1111,7 @@ export const elIndexGetAlias = async (indexName: string): Promise<any> => {
   return oebp(r_1);
 };
 export const elPlatformIndices = async (): Promise<any> => {
+  if (isCorroboreProviderConfigured()) return [];
   const args = { index: `${ES_INDEX_PREFIX}*`, format: 'JSON' };
   if (engine instanceof ElkClient) {
     const r = await engine.cat.indices(args);
@@ -1011,6 +1121,7 @@ export const elPlatformIndices = async (): Promise<any> => {
   return oebp(r_1);
 };
 export const elPlatformMapping = async (index: any): Promise<Record<string, any>> => {
+  if (isCorroboreProviderConfigured()) return {};
   if (engine instanceof ElkClient) {
     const r = await engine.indices.getMapping({ index });
     return oebp(r)[index].mappings.properties;
@@ -1019,6 +1130,7 @@ export const elPlatformMapping = async (index: any): Promise<Record<string, any>
   return oebp(r_1)[index].mappings.properties;
 };
 export const elIndexSetting = async (index: any): Promise<{ settings: any; rollover_alias: string }> => {
+  if (isCorroboreProviderConfigured()) return { settings: {}, rollover_alias: String(index) };
   let settings;
   if (engine instanceof ElkClient) {
     const r = await engine.indices.getSettings({ index });
@@ -1543,6 +1655,7 @@ const elCreateIndexTemplate = async (index: string, mappingProperties: Record<st
 const sortMappingsKeys = (o: Record<string, any>): Record<string, any> => (Object(o) !== o || Array.isArray(o) ? o
   : Object.keys(o).sort().reduce((a, k) => ({ ...a, [k]: sortMappingsKeys(o[k]) }), {}));
 export const elUpdateIndicesMappings = async (): Promise<void> => {
+  if (isCorroboreProviderConfigured()) return;
   // Update core settings
   await updateCoreSettings();
   // Reset the templates
@@ -1617,6 +1730,7 @@ export const elUpdateIndicesMappings = async (): Promise<void> => {
   }
 };
 export const elDeleteIndex = async (index: string) => {
+  if (isCorroboreProviderConfigured()) return;
   const indexesToRemove = await elIndexGetAlias(index);
   try {
     let response;
@@ -1632,6 +1746,7 @@ export const elDeleteIndex = async (index: string) => {
   }
 };
 export const elCreateIndex = async (index: string, mappingProperties: Record<string, any>): Promise<any> => {
+  if (isCorroboreProviderConfigured()) return { acknowledged: true, index };
   await elCreateIndexTemplate(index, mappingProperties);
   const indexName = `${index}${ES_INDEX_PATTERN_SUFFIX}`;
   let isExist;
@@ -1651,6 +1766,7 @@ export const elCreateIndex = async (index: string, mappingProperties: Record<str
   return null;
 };
 export const elCreateIndices = async (indexesToCreate = WRITE_PLATFORM_INDICES): Promise<any[]> => {
+  if (isCorroboreProviderConfigured()) return indexesToCreate.map((index) => ({ acknowledged: true, index }));
   await updateCoreSettings();
   await elCreateLifecyclePolicy();
   const createdIndices = [];
@@ -1667,6 +1783,10 @@ export const elCreateIndices = async (indexesToCreate = WRITE_PLATFORM_INDICES):
 
 // Initialize
 export const initializeSchema = async () => {
+  if (isCorroboreProviderConfigured()) {
+    logApp.info('[INIT] Corrobore canonical schema is ready');
+    return true;
+  }
   // New platform so delete all indices to prevent conflict
   const isInternalIndexExists = await elIndexExists(INDEX_INTERNAL_OBJECTS);
   if (isInternalIndexExists) {
@@ -1681,6 +1801,7 @@ export const initializeSchema = async () => {
 };
 
 export const elDeleteIndices = async (indexesToDelete: string[]): Promise<any[]> => {
+  if (isCorroboreProviderConfigured()) return indexesToDelete.map((index) => ({ acknowledged: true, index }));
   return Promise.all(
     indexesToDelete.map((index) => {
       if (engine instanceof ElkClient) {
@@ -1893,6 +2014,18 @@ export const elFindByIds = async <T extends BasicStoreBase>(
   ids: string[] | string,
   opts: ElFindByIdsOpts = {},
 ): Promise<T[] | Record<string, T>> => {
+  if (isCorroboreProviderConfigured()) {
+    const requestedIds = (Array.isArray(ids) ? ids : [ids]).filter((id) => isNotEmptyField(id));
+    const requestedTypes = opts.type == null ? [] : Array.isArray(opts.type) ? opts.type : [opts.type];
+    const loadedRecords = await Promise.all(requestedIds.map(async (id) => {
+      const response = await corroboreRead({ operation: 'get_by_id', request: { id } }, context, user);
+      return corroboreRecordBody<T>(response);
+    })) as Array<T | undefined>;
+    const records = loadedRecords.filter((record): record is T => record !== undefined
+      && (requestedTypes.length === 0 || requestedTypes.includes(record.entity_type)));
+    if (opts.toMap) return elConvertHitsToMap<T>(records, { mapWithAllIds: opts.mapWithAllIds });
+    return records;
+  }
   const {
     indices,
     baseData = false,
@@ -3287,6 +3420,64 @@ export const elPaginate = async <T extends BasicStoreBase>(
   indexName: string | string[] | undefined | null,
   options: PaginateOpts = {},
 ): Promise<BasicConnection<T> | T[] | PaginateResultWithMeta<T>> => {
+  if (isCorroboreProviderConfigured()) {
+    const first = Math.min(options.first ?? ES_DEFAULT_PAGINATION, ES_MAX_PAGINATION);
+    const kinds = options.types == null ? [] : Array.isArray(options.types) ? options.types : [options.types];
+    const predicate = filterGroupToPredicate(options.filters);
+    const idPredicate = options.ids && options.ids.length > 0 ? {
+      operator: 'condition',
+      arguments: { field: 'internal_id', operator: 'in', value: options.ids },
+    } : null;
+    const combinedPredicate = predicate && idPredicate
+      ? { operator: 'and', arguments: [predicate, idPredicate] }
+      : predicate ?? idPredicate;
+    const orderBy = typeof options.orderBy === 'string' && options.orderBy.length > 0
+      ? [{ field: options.orderBy, direction: options.orderMode === 'desc' ? 'descending' : 'ascending' }]
+      : [];
+    const query = {
+      kinds,
+      filters: [],
+      predicate: combinedPredicate,
+      order_by: orderBy,
+      limit: first,
+      include_total_count: true,
+    };
+    let page: any;
+    if (options.search) {
+      const searchResponse = await corroboreRead({ operation: 'search', request: {
+        expression: { text: options.search, kinds },
+        limit: first,
+      } }, context, user);
+      if (searchResponse.response !== 'search') throw DatabaseError(`Corrobore returned ${searchResponse.response} for full-text search`);
+      const hits = searchResponse.data?.hits ?? [];
+      const records = (await Promise.all(hits.map(async (hit: any) => {
+        const response = await corroboreRead({ operation: 'get_by_id', request: { id: hit.id } }, context, user);
+        return response.data;
+      }))).filter((record: any) => record?.body);
+      page = {
+        records,
+        next_token: searchResponse.data?.next_cursor ?? null,
+        total_count: searchResponse.data?.total ?? records.length,
+      };
+    } else {
+      const operation = options.after
+        ? { operation: 'paginate', request: { query, page_size: first, token: options.after } }
+        : { operation: 'list', request: query };
+      page = corroboreRecordPage(await corroboreRead(operation, context, user));
+    }
+    const elements = page.records.map((record: any) => record.body) as T[];
+    const connection = recordPageToConnection(page) as unknown as BasicConnection<T>;
+    const result = options.connectionFormat === false ? elements : connection;
+    if (options.withResultMeta) {
+      return {
+        elements: result,
+        endCursor: page.next_token,
+        total: page.total_count ?? elements.length,
+        filterCount: 0,
+      };
+    }
+    return result;
+  }
   const {
     baseData = false,
     baseFields = [],
@@ -3467,6 +3658,10 @@ export const elCardinalityCount = async (
   field: string,
   options = {},
 ): Promise<number> => {
+  if (isCorroboreProviderConfigured()) {
+    const result = await corroboreAggregate(context, user, options as QueryBodyBuilderOpts, { kind: 'cardinality', field });
+    return Number(result.value ?? 0);
+  }
   const cardinalityAggs: any = {
     cardinality_count: {
       cardinality: {
@@ -3494,6 +3689,18 @@ export const elCount = async (
   indexName: string | string[] | undefined,
   options = {},
 ): Promise<number> => {
+  if (isCorroboreProviderConfigured()) {
+    const typedOptions = options as QueryBodyBuilderOpts;
+    const kinds = typedOptions.types ?? [];
+    const response = await corroboreRead({ operation: 'count', request: {
+      filter: {},
+      kinds,
+      filters: [],
+      ...(typedOptions.filters ? { predicate: filterGroupToPredicate(typedOptions.filters) } : {}),
+    } }, context, user);
+    if (response.response !== 'count') throw DatabaseError(`Corrobore returned ${response.response} for count`);
+    return response.data?.count ?? 0;
+  }
   const body = await elQueryBodyBuilder(context, user, { ...options, noSize: true, noSort: true });
   const query = { index: getIndicesToQuery(context, user, indexName), body };
   logApp.debug('[SEARCH] elCount', { query });
@@ -3512,6 +3719,17 @@ export const elHistogramCount = async (
   countField: string = '',
 ) => {
   const { interval, field, types = null } = options;
+  if (isCorroboreProviderConfigured()) {
+    if (interval !== 'hour' && interval !== 'day') {
+      throw UnsupportedError(`Corrobore date histograms support hour or day, received ${interval}`);
+    }
+    if (!field) throw FunctionalError('Corrobore date histogram requires a field');
+    if (unique || countField) throw UnsupportedError('Corrobore weighted or unique date histograms require a typed aggregate plan');
+    const result = await corroboreAggregate(context, user, options, {
+      kind: 'date_histogram', field, interval, time_zone_offset_minutes: 0, include_empty: true,
+    });
+    return (result.buckets ?? []).map((bucket: any) => ({ date: bucket.key, value: bucket.count }));
+  }
   const body = await elQueryBodyBuilder(context, user, { ...options, dateAttribute: field, noSize: true, noSort: true, intervalInclude: true });
   body.size = 0; // we only need aggregations
   let dateFormat;
@@ -3585,6 +3803,16 @@ export const elAggregationCount = async (
   options: AggregationCountOpts = { field: '' },
 ): Promise<{ label: string; value: any; count: number }[]> => {
   const { field, types = null, weightField = 'i_inference_weight', normalizeLabel = true, convertEntityTypeLabel = false } = options;
+  if (isCorroboreProviderConfigured()) {
+    const result = await corroboreAggregate(context, user, options, { kind: 'terms', field, limit: MAX_AGGREGATION_SIZE });
+    return (result.buckets ?? []).map((bucket: any) => {
+      let label = bucket.key;
+      if (typeof label === 'number') label = String(label);
+      else if (field === 'entity_type' && convertEntityTypeLabel) label = isStixCoreRelationship(label) ? label : generateInternalType({ type: label });
+      else if (normalizeLabel) label = pascalize(label);
+      return { label, value: bucket.count, count: bucket.count };
+    });
+  }
   const isIdFields = field?.endsWith('internal_id') || field?.endsWith('.id');
   const body = await elQueryBodyBuilder(context, user, { ...options, noSize: true, noSort: true });
   body.size = 0;
@@ -3995,6 +4223,15 @@ export const elAttributeValues = async (
 ) => {
   const { orderMode = 'asc', search } = opts;
   const first = opts.first ?? ES_DEFAULT_PAGINATION;
+  if (isCorroboreProviderConfigured()) {
+    const result = await corroboreAggregate(context, user, {}, { kind: 'terms', field, limit: first });
+    const values = (result.buckets ?? [])
+      .map((bucket: any) => bucket.key)
+      .filter((value: string) => !search || value.toLowerCase().includes(search.toLowerCase()))
+      .sort((left: string, right: string) => orderMode === 'desc' ? right.localeCompare(left) : left.localeCompare(right));
+    const nodeElements = values.map((value: any) => ({ node: { id: value, key: field, value } }));
+    return buildPagination(0, null, nodeElements, nodeElements.length);
+  }
   const markingRestrictions = await buildDataRestrictions(context, user);
   const must = [];
   if (isNotEmptyField(search) && (search as string).length > 0) {
@@ -4051,6 +4288,10 @@ export const elIndex = async (
   documentBody: Record<string, any>,
   opts: { refresh?: boolean; pipeline?: any } = {},
 ) => {
+  if (isCorroboreProviderConfigured()) {
+    await elRawIndex({ index: indexName, id: documentBody.internal_id, body: R.dissoc('_index', documentBody) });
+    return documentBody;
+  }
   const { refresh = true, pipeline } = opts;
   const documentId = documentBody.internal_id;
   const entityType = documentBody.entity_type ? documentBody.entity_type : '';
@@ -4085,6 +4326,14 @@ export const elUpdate = async (
   documentBody: any,
   retry = ES_RETRY_ON_CONFLICT,
 ) => {
+  if (isCorroboreProviderConfigured()) {
+    const patch = documentBody.doc ?? documentBody.script?.params ?? documentBody;
+    return corroboreWrite({ operation: 'update', request: {
+      id: documentId,
+      expected_revision: null,
+      patch,
+    } }, context, context.user ?? SYSTEM_USER, corroboreIdempotencyKey('update', { documentId, patch }));
+  }
   const updateOperation = async () => {
     const entityType = documentBody.entity_type ? documentBody.entity_type : '';
     const updateRequest = {
@@ -4131,6 +4380,9 @@ export const elReplace = async (
   });
 };
 export const elDelete = (indexName: string, documentId: string) => {
+  if (isCorroboreProviderConfigured()) {
+    return elRawDelete({ index: indexName, id: documentId });
+  }
   const deleteOperation = async () => {
     const deleteRequest = {
       id: documentId,

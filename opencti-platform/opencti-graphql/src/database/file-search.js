@@ -14,6 +14,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 */
 
 import * as R from 'ramda';
+import { createHash } from 'node:crypto';
 import { now } from '../utils/format';
 import { buildRefRelationKey } from '../schema/general';
 import { RELATION_GRANTED_TO, RELATION_OBJECT_MARKING } from '../schema/stixRefRelationship';
@@ -21,6 +22,29 @@ import { buildPagination, cursorToOffset, INDEX_FILES, READ_DATA_INDICES_WITHOUT
 import { DatabaseError } from '../config/errors';
 import { logApp } from '../config/conf';
 import { buildDataRestrictions, elFindByIds, elIndex, elRawCount, elRawDeleteByQuery, elRawSearch, elRawUpdateByQuery, ES_MINIMUM_FIXED_PAGINATION } from './engine';
+import { corroboreFileCommand, corroboreRead, isCorroboreProviderConfigured } from './providers/corrobore/corrobore-provider';
+
+const relationIds = (entity, field) => (entity?.[field] ?? [])
+  .map((value) => value?.internal_id ?? value?.id ?? value)
+  .filter((value) => typeof value === 'string' && value.length > 0);
+
+const corroboreFileAccess = (entity) => ({
+  marking_ids: relationIds(entity, RELATION_OBJECT_MARKING),
+  organization_ids: relationIds(entity, RELATION_GRANTED_TO),
+  authorized_members: entity?.authorized_members ?? [],
+  tenant_ids: entity?.tenant_ids ?? [],
+  creator_ids: entity?.creator_id ? [entity.creator_id].flat() : [],
+  owner_ids: entity?.objectOrganization?.map((value) => value.internal_id ?? value.id) ?? [],
+  sharing_policy: entity?.sharing_policy ?? null,
+  authorized_authorities: entity?.authorized_authorities ?? [],
+});
+
+const fileDigest = (file) => {
+  const declared = file.hashes?.SHA256 ?? file.hashes?.sha256 ?? file.sha256;
+  if (typeof declared === 'string' && /^[a-f0-9]{64}$/i.test(declared)) return declared.toLowerCase();
+  const content = typeof file.content === 'string' ? Buffer.from(file.content, 'base64') : Buffer.alloc(0);
+  return createHash('sha256').update(content).digest('hex');
+};
 
 const buildIndexFileBody = (documentId, file, entity = null) => {
   const documentBody = {
@@ -52,6 +76,25 @@ export const elIndexFiles = async (context, user, files) => {
   const entityIds = files.filter((file) => !!file.entity_id).map((file) => file.entity_id);
   const opts = { indices: READ_DATA_INDICES_WITHOUT_INTERNAL, toMap: true };
   const entitiesMap = await elFindByIds(context, user, entityIds, opts);
+  if (isCorroboreProviderConfigured()) {
+    for (const file of files) {
+      const entity = file.entity_id ? entitiesMap[file.entity_id] : null;
+      await corroboreFileCommand({
+        operation: 'enqueue',
+        descriptor: {
+          file_id: file.file_id ?? file.id,
+          source_object_id: file.entity_id ?? file.source_object_id ?? 'opencti--unattached-file',
+          blob_key: file.file_id ?? file.id,
+          name: file.name,
+          mime_type: file.mime_type ?? file.mimetype ?? file.content_type ?? 'application/octet-stream',
+          content_hash: fileDigest(file),
+          version: Number(file.version ?? 1),
+          access: corroboreFileAccess(entity),
+        },
+      });
+    }
+    return;
+  }
   for (let index = 0; index < files.length; index += 1) {
     const file = files[index];
     const { internal_id, file_data, file_id, entity_id } = file;
@@ -211,6 +254,47 @@ const elBuildSearchFilesQueryBody = async (context, user, options = {}) => {
 export const elSearchFiles = async (context, user, options = {}) => {
   const { search = null, first = ES_MINIMUM_FIXED_PAGINATION, after, connectionFormat = true, includeContent = false, orderBy = null, orderMode = 'asc' } = options;
   const { fields = [], excludeFields = ['attachment.content'], highlight = true } = options; // results format options
+  if (isCorroboreProviderConfigured()) {
+    const { fileIds = [], entityIds = [], mimeTypes = [] } = options;
+    if (fileIds.length > 0) throw DatabaseError('Corrobore file search does not accept fileIds; use entityIds or full-text criteria');
+    const response = await corroboreRead({ operation: 'search', request: {
+      expression: {
+        text: decodeSearch(search ?? ''),
+        content: true,
+        mime_types: mimeTypes,
+        owner_ids: [],
+        source_object_ids: entityIds,
+        cursor: after ?? null,
+      },
+      limit: first,
+    } }, context, user);
+    if (response.response !== 'search') throw DatabaseError(`Corrobore returned ${response.response} for file search`);
+    const hits = response.data?.hits ?? [];
+    const edges = hits.map((hit) => ({
+      cursor: response.data?.next_cursor ?? '',
+      node: {
+        _index: INDEX_FILES,
+        id: hit.id,
+        internal_id: hit.id,
+        file_id: hit.id,
+        entity_id: hit.metadata?.source_object_id,
+        name: hit.metadata?.name ?? hit.id,
+        searchOccurrences: hit.highlights?.length ?? 0,
+        ...(includeContent ? { content: hit.snippet ?? '' } : {}),
+      },
+    }));
+    if (!connectionFormat) return edges.map((edge) => edge.node);
+    return {
+      edges,
+      pageInfo: {
+        startCursor: edges[0]?.cursor ?? '',
+        endCursor: edges.at(-1)?.cursor ?? '',
+        hasNextPage: response.data?.next_cursor != null,
+        hasPreviousPage: after != null,
+        globalCount: response.data?.total ?? edges.length,
+      },
+    };
+  }
   const searchAfter = after ? cursorToOffset(after) : undefined;
   const body = await elBuildSearchFilesQueryBody(context, user, options);
   body.size = first;
@@ -256,6 +340,10 @@ export const elSearchFiles = async (context, user, options = {}) => {
 };
 
 export const elCountFiles = async (context, user, options = {}) => {
+  if (isCorroboreProviderConfigured()) {
+    const result = await elSearchFiles(context, user, { ...options, first: 1000, connectionFormat: true });
+    return result.pageInfo.globalCount;
+  }
   const body = await elBuildSearchFilesQueryBody(context, user, options);
   const query = { index: INDEX_FILES, body };
   logApp.debug('elCountFiles', { query });
@@ -264,6 +352,10 @@ export const elCountFiles = async (context, user, options = {}) => {
 
 export const elDeleteFilesByIds = async (fileIds) => {
   if (!fileIds) {
+    return;
+  }
+  if (isCorroboreProviderConfigured()) {
+    await corroboreFileCommand({ operation: 'delete', file_ids: fileIds });
     return;
   }
   const query = {
@@ -279,6 +371,9 @@ export const elDeleteFilesByIds = async (fileIds) => {
 };
 
 export const elDeleteAllFiles = async () => {
+  if (isCorroboreProviderConfigured()) {
+    throw DatabaseError('Corrobore requires explicit file identifiers for deletion');
+  }
   await elRawDeleteByQuery({
     index: READ_INDEX_FILES,
     refresh: true,
