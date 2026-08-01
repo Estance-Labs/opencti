@@ -6,6 +6,7 @@ import {
   corroboreIdentifiersPredicate,
   corroboreIncludesRelationships,
   corroboreRecordToStore,
+  corroboreTypeMatches,
   filterGroupToPredicate,
   parseCorroboreConfig,
   recordPageToConnection,
@@ -58,6 +59,17 @@ describe('Corrobore knowledge data provider', () => {
       ],
     });
     expect(() => corroboreIdentifiersPredicate([], ['internal_id'])).toThrow(/at least one identifier/i);
+  });
+
+  it('matches concrete entities through their abstract OpenCTI parent types', () => {
+    const organization = {
+      entity_type: 'Organization',
+      parent_types: ['Basic-Object', 'Stix-Object', 'Stix-Core-Object', 'Stix-Domain-Object', 'Identity'],
+    };
+    expect(corroboreTypeMatches(organization, ['Identity'])).toBe(true);
+    expect(corroboreTypeMatches(organization, ['Organization'])).toBe(true);
+    expect(corroboreTypeMatches(organization, ['Malware'])).toBe(false);
+    expect(corroboreTypeMatches(organization, [])).toBe(true);
   });
 
   it('preserves relationship index scope for graph reads', () => {

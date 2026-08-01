@@ -204,6 +204,7 @@ import {
   corroboreIdentifiersPredicate,
   corroboreRead,
   corroboreRecordToStore,
+  corroboreTypeMatches,
   corroboreProviderVersion,
   corroboreWrite,
   filterGroupToPredicate,
@@ -2037,10 +2038,18 @@ export const elFindByIds = async <T extends BasicStoreBase>(
     );
     const splitSize = Math.max(ES_MAX_PAGINATION / 2, ES_DEFAULT_PAGINATION);
     const pages = await Promise.all(R.splitEvery(splitSize, requestedIds).map(async (identifierGroup) => {
+      const identifierPredicate = corroboreIdentifiersPredicate(identifierGroup, IDS_ATTRIBUTES);
+      const predicate = requestedTypes.length === 0 ? identifierPredicate : {
+        operator: 'and',
+        arguments: [
+          identifierPredicate,
+          corroboreIdentifiersPredicate(requestedTypes, ['entity_type', 'parent_types']),
+        ],
+      };
       const response = await corroboreRead({ operation: 'list', request: {
-        kinds: requestedTypes,
+        kinds: [],
         filters: [],
-        predicate: corroboreIdentifiersPredicate(identifierGroup, IDS_ATTRIBUTES),
+        predicate,
         order_by: [],
         limit: splitSize,
         include_total_count: false,
@@ -2049,8 +2058,7 @@ export const elFindByIds = async <T extends BasicStoreBase>(
       return corroboreRecordPage(response);
     }));
     const records = pages.flatMap((page) => page.records.map((record: any) => corroboreRecordToStore(record) as T))
-      .filter((record): record is T => record !== undefined
-        && (requestedTypes.length === 0 || requestedTypes.includes(record.entity_type)));
+      .filter((record): record is T => record !== undefined && corroboreTypeMatches(record, requestedTypes));
     if (opts.toMap) return elConvertHitsToMap<T>(records, { mapWithAllIds: opts.mapWithAllIds });
     return records;
   }

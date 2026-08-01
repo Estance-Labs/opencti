@@ -147,6 +147,17 @@ export const corroboreIdentifiersPredicate = (identifiers: string[], fields: str
   };
 };
 
+/** Preserve OpenCTI's concrete-or-parent type matching after a Corrobore read. */
+export const corroboreTypeMatches = (record: Record<string, unknown>, types: string[]): boolean => {
+  // Match the concrete entity type or any abstract entry in `parent_types`.
+  if (types.length === 0) return true;
+  const entityType = typeof record.entity_type === 'string' ? record.entity_type : undefined;
+  const parentTypes = Array.isArray(record.parent_types)
+    ? record.parent_types.filter((parent): parent is string => typeof parent === 'string')
+    : [];
+  return types.some((type) => type === entityType || parentTypes.includes(type));
+};
+
 const required = (value: string | undefined, name: string): string => {
   if (typeof value !== 'string' || value.trim().length === 0) {
     throw new Error(`${name} is required`);
