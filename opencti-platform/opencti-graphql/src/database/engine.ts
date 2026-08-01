@@ -205,6 +205,7 @@ import {
   corroboreRead,
   corroboreRecordToStore,
   corroboreTypeMatches,
+  corroboreTypePredicate,
   corroboreProviderVersion,
   corroboreWrite,
   filterGroupToPredicate,
@@ -2039,11 +2040,12 @@ export const elFindByIds = async <T extends BasicStoreBase>(
     const splitSize = Math.max(ES_MAX_PAGINATION / 2, ES_DEFAULT_PAGINATION);
     const pages = await Promise.all(R.splitEvery(splitSize, requestedIds).map(async (identifierGroup) => {
       const identifierPredicate = corroboreIdentifiersPredicate(identifierGroup, IDS_ATTRIBUTES);
-      const predicate = requestedTypes.length === 0 ? identifierPredicate : {
+      const typePredicate = corroboreTypePredicate(requestedTypes);
+      const predicate = typePredicate === null ? identifierPredicate : {
         operator: 'and',
         arguments: [
           identifierPredicate,
-          corroboreIdentifiersPredicate(requestedTypes, ['entity_type', 'parent_types']),
+          typePredicate,
         ],
       };
       const response = await corroboreRead({ operation: 'list', request: {
@@ -3468,14 +3470,16 @@ export const elPaginate = async <T extends BasicStoreBase>(
       operator: 'condition',
       arguments: { field: 'internal_id', operator: 'in', value: options.ids },
     } : null;
-    const combinedPredicate = predicate && idPredicate
-      ? { operator: 'and', arguments: [predicate, idPredicate] }
-      : predicate ?? idPredicate;
+    const typePredicate = corroboreTypePredicate(kinds);
+    const predicates = [predicate, idPredicate, typePredicate].filter((candidate) => candidate !== null);
+    const combinedPredicate = predicates.length > 1
+      ? { operator: 'and', arguments: predicates }
+      : predicates[0] ?? null;
     const orderBy = typeof options.orderBy === 'string' && options.orderBy.length > 0
       ? [{ field: options.orderBy, direction: options.orderMode === 'desc' ? 'descending' : 'ascending' }]
       : [];
     const query = {
-      kinds,
+      kinds: [],
       filters: [],
       predicate: combinedPredicate,
       order_by: orderBy,

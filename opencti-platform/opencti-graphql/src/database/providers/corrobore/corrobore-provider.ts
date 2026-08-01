@@ -147,6 +147,12 @@ export const corroboreIdentifiersPredicate = (identifiers: string[], fields: str
   };
 };
 
+/** Scope Corrobore list reads to concrete OpenCTI types and their abstract parents. */
+export const corroboreTypePredicate = (types: string[]): CorroborePredicate | null => {
+  // Build the provider predicate without relying on Corrobore's exact `kind` scope.
+  return types.length === 0 ? null : corroboreIdentifiersPredicate(types, ['entity_type', 'parent_types']);
+};
+
 /** Preserve OpenCTI's concrete-or-parent type matching after a Corrobore read. */
 export const corroboreTypeMatches = (record: Record<string, unknown>, types: string[]): boolean => {
   // Match the concrete entity type or any abstract entry in `parent_types`.
