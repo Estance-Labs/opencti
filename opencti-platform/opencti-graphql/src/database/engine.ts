@@ -200,7 +200,9 @@ import { AbortError } from 'node-fetch';
 import { createHash } from 'node:crypto';
 import {
   corroboreIncludesRelationships,
+  corroboreIdentifier,
   corroboreRead,
+  corroboreRecordToStore,
   corroboreProviderVersion,
   corroboreWrite,
   filterGroupToPredicate,
@@ -302,7 +304,8 @@ const corroboreIdempotencyKey = (operation: string, payload: unknown): string =>
 
 const corroboreRecordBody = <T extends BasicStoreBase>(response: { response: string; data: any }): T | undefined => {
   if (response.response !== 'record') throw DatabaseError(`Corrobore returned ${response.response} for a point read`);
-  return response.data?.body as T | undefined;
+  if (response.data == null) return undefined;
+  return corroboreRecordToStore(response.data) as T;
 };
 
 const corroboreRecordPage = (response: { response: string; data: any }) => {
@@ -2022,7 +2025,9 @@ export const elFindByIds = async <T extends BasicStoreBase>(
   opts: ElFindByIdsOpts = {},
 ): Promise<T[] | Record<string, T>> => {
   if (isCorroboreProviderConfigured()) {
-    const requestedIds = (Array.isArray(ids) ? ids : [ids]).filter((id) => isNotEmptyField(id));
+    const requestedIds = ((Array.isArray(ids) ? ids : [ids]) as unknown[])
+      .filter((id) => isNotEmptyField(id))
+      .map(corroboreIdentifier);
     const requestedTypes = opts.type == null ? [] : Array.isArray(opts.type) ? opts.type : [opts.type];
     const loadedRecords = await Promise.all(requestedIds.map(async (id) => {
       const response = await corroboreRead({ operation: 'get_by_id', request: { id } }, context, user);
@@ -3477,7 +3482,7 @@ export const elPaginate = async <T extends BasicStoreBase>(
         : { operation: 'list', request: query };
       page = corroboreRecordPage(await corroboreRead(operation, context, user));
     }
-    const elements = page.records.map((record: any) => record.body) as T[];
+    const elements = page.records.map((record: any) => corroboreRecordToStore(record)) as T[];
     const connection = recordPageToConnection(page) as unknown as BasicConnection<T>;
     const result = options.connectionFormat === false ? elements : connection;
     if (options.withResultMeta) {

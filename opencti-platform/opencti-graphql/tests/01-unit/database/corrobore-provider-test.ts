@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   CorroboreProviderClient,
   accessContextFromUser,
+  corroboreIdentifier,
   corroboreIncludesRelationships,
+  corroboreRecordToStore,
   filterGroupToPredicate,
   parseCorroboreConfig,
   recordPageToConnection,
@@ -16,6 +18,31 @@ const success = (response: string, data: unknown) => ({
 });
 
 describe('Corrobore knowledge data provider', () => {
+  it('restores the canonical OpenCTI store identifier on Corrobore records', () => {
+    expect(corroboreRecordToStore({
+      id: 'label--1',
+      kind: 'Label',
+      revision: 1,
+      body: { internal_id: 'label--1', value: 'demo' },
+    })).toEqual({
+      _id: 'label--1',
+      internal_id: 'label--1',
+      value: 'demo',
+    });
+
+    expect(() => corroboreRecordToStore({
+      id: '' as string,
+      kind: 'Label',
+      revision: 1,
+      body: { internal_id: 'label--1' },
+    })).toThrow(/canonical id/i);
+  });
+
+  it('rejects resolved objects before they can become Corrobore point-read identifiers', () => {
+    expect(corroboreIdentifier('label--1')).toBe('label--1');
+    expect(() => corroboreIdentifier({ internal_id: 'label--1' })).toThrow(/point-read identifier/i);
+  });
+
   it('preserves relationship index scope for graph reads', () => {
     const relationships = ['opencti_stix_core_relationships*', 'opencti_stix_meta_relationships*'];
     expect(corroboreIncludesRelationships(
@@ -190,7 +217,7 @@ describe('Corrobore knowledge data provider', () => {
       next_token: 'kde1.opaque.token',
       total_count: 7,
     })).toEqual({
-      edges: [{ cursor: 'kde1.opaque.token', node: { internal_id: 'indicator--1' } }],
+      edges: [{ cursor: 'kde1.opaque.token', node: { _id: 'indicator--1', internal_id: 'indicator--1' } }],
       pageInfo: {
         startCursor: 'kde1.opaque.token', endCursor: 'kde1.opaque.token', hasNextPage: true, hasPreviousPage: false, globalCount: 7,
       },

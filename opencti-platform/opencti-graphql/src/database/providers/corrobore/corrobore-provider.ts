@@ -47,6 +47,8 @@ export type CorroboreRecordPage = {
   total_count: number | null;
 };
 
+type CorroboreRecord = CorroboreRecordPage['records'][number];
+
 /** Preserve the OpenCTI index scope when selecting graph records in Corrobore. */
 export const corroboreIncludesRelationships = (
   queryIndices: string | string[] | undefined | null,
@@ -100,6 +102,25 @@ export class CorroboreProviderError extends Error {
     this.retryable = retryable;
   }
 }
+
+/** Restore the provider-owned store metadata expected by OpenCTI resolvers. */
+export const corroboreRecordToStore = (record: CorroboreRecord): Record<string, unknown> => {
+  if (typeof record?.id !== 'string' || record.id.trim().length === 0) {
+    throw new CorroboreProviderError('invalid_response', 'Corrobore record is missing its canonical id', false);
+  }
+  if (record.body === null || typeof record.body !== 'object' || Array.isArray(record.body)) {
+    throw new CorroboreProviderError('invalid_response', `Corrobore record ${record.id} has an invalid body`, false);
+  }
+  return { ...record.body, _id: record.id };
+};
+
+/** Reject resolved objects before a Corrobore point read is sent over HTTP. */
+export const corroboreIdentifier = (value: unknown): string => {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new CorroboreProviderError('invalid_request', 'Corrobore point-read identifier must be a non-empty string', false);
+  }
+  return value;
+};
 
 const required = (value: string | undefined, name: string): string => {
   if (typeof value !== 'string' || value.trim().length === 0) {
@@ -215,7 +236,7 @@ export const filterGroupToPredicate = (filterGroup: CorroboreFilterGroup | null 
 /** Build the OpenCTI GraphQL connection while keeping Corrobore cursors opaque. */
 export const recordPageToConnection = (page: CorroboreRecordPage) => {
   const cursor = page.next_token ?? '';
-  const edges = page.records.map((record) => ({ cursor, node: record.body }));
+  const edges = page.records.map((record) => ({ cursor, node: corroboreRecordToStore(record) }));
   return {
     edges,
     pageInfo: {
