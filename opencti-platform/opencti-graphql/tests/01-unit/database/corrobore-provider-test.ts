@@ -7,6 +7,7 @@ import {
   corroboreIncludesRelationships,
   corroboreRecordToStore,
   corroboreTypeMatches,
+  corroboreTypePredicate,
   filterGroupToPredicate,
   parseCorroboreConfig,
   recordPageToConnection,
@@ -70,6 +71,17 @@ describe('Corrobore knowledge data provider', () => {
     expect(corroboreTypeMatches(organization, ['Organization'])).toBe(true);
     expect(corroboreTypeMatches(organization, ['Malware'])).toBe(false);
     expect(corroboreTypeMatches(organization, [])).toBe(true);
+  });
+
+  it('scopes list reads through concrete and abstract OpenCTI types', () => {
+    expect(corroboreTypePredicate(['Identity'])).toEqual({
+      operator: 'or',
+      arguments: [
+        { operator: 'condition', arguments: { field: 'entity_type', operator: 'in', value: ['Identity'] } },
+        { operator: 'condition', arguments: { field: 'parent_types', operator: 'in', value: ['Identity'] } },
+      ],
+    });
+    expect(corroboreTypePredicate([])).toBeNull();
   });
 
   it('preserves relationship index scope for graph reads', () => {
