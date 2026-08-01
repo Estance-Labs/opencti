@@ -122,6 +122,31 @@ export const corroboreIdentifier = (value: unknown): string => {
   return value;
 };
 
+/** Match point-read keys against every identifier field stored by OpenCTI. */
+export const corroboreIdentifiersPredicate = (identifiers: string[], fields: string[]): CorroborePredicate => {
+  // Build one typed membership condition per field and preserve their OR semantics.
+  if (identifiers.length === 0) {
+    throw new CorroboreProviderError('invalid_request', 'Corrobore alias lookup requires at least one identifier', false);
+  }
+  const values = identifiers.map(corroboreIdentifier);
+  const identifierFields = fields.map((field) => {
+    if (typeof field !== 'string' || field.trim().length === 0) {
+      throw new CorroboreProviderError('invalid_request', 'Corrobore alias lookup fields must be non-empty strings', false);
+    }
+    return field;
+  });
+  if (identifierFields.length === 0) {
+    throw new CorroboreProviderError('invalid_request', 'Corrobore alias lookup requires at least one field', false);
+  }
+  return {
+    operator: 'or',
+    arguments: identifierFields.map((field) => ({
+      operator: 'condition',
+      arguments: { field, operator: 'in', value: values },
+    })),
+  };
+};
+
 const required = (value: string | undefined, name: string): string => {
   if (typeof value !== 'string' || value.trim().length === 0) {
     throw new Error(`${name} is required`);
