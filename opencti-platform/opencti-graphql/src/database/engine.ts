@@ -201,6 +201,7 @@ import { createHash } from 'node:crypto';
 import {
   corroboreIncludesRelationships,
   corroboreIdentifier,
+  corroboreIdentifiersPredicate,
   corroboreRead,
   corroboreRecordToStore,
   corroboreProviderVersion,
@@ -2028,13 +2029,28 @@ export const elFindByIds = async <T extends BasicStoreBase>(
     const requestedIds = ((Array.isArray(ids) ? ids : [ids]) as unknown[])
       .filter((id) => isNotEmptyField(id))
       .map(corroboreIdentifier);
+    if (requestedIds.length === 0) return opts.toMap ? {} : [];
     const requestedTypes = opts.type == null ? [] : Array.isArray(opts.type) ? opts.type : [opts.type];
-    const loadedRecords = await Promise.all(requestedIds.map(async (id) => {
-      const response = await corroboreRead({ operation: 'get_by_id', request: { id } }, context, user);
-      return corroboreRecordBody<T>(response);
-    })) as Array<T | undefined>;
-    const records = loadedRecords.filter((record): record is T => record !== undefined
-      && (requestedTypes.length === 0 || requestedTypes.includes(record.entity_type)));
+    const includeRelationships = opts.withoutRels === false || corroboreIncludesRelationships(
+      computeQueryIndices(opts.indices, requestedTypes),
+      READ_RELATIONSHIPS_INDICES,
+    );
+    const splitSize = Math.max(ES_MAX_PAGINATION / 2, ES_DEFAULT_PAGINATION);
+    const pages = await Promise.all(R.splitEvery(splitSize, requestedIds).map(async (identifierGroup) => {
+      const response = await corroboreRead({ operation: 'list', request: {
+        kinds: requestedTypes,
+        filters: [],
+        predicate: corroboreIdentifiersPredicate(identifierGroup, IDS_ATTRIBUTES),
+        order_by: [],
+        limit: splitSize,
+        include_total_count: false,
+        include_relationships: includeRelationships,
+      } }, context, user);
+      return corroboreRecordPage(response);
+    }));
+    const records = pages.flatMap((page) => page.records.map((record: any) => corroboreRecordToStore(record) as T))
+      .filter((record): record is T => record !== undefined
+        && (requestedTypes.length === 0 || requestedTypes.includes(record.entity_type)));
     if (opts.toMap) return elConvertHitsToMap<T>(records, { mapWithAllIds: opts.mapWithAllIds });
     return records;
   }

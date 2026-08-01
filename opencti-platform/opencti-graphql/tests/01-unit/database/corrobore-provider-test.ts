@@ -3,6 +3,7 @@ import {
   CorroboreProviderClient,
   accessContextFromUser,
   corroboreIdentifier,
+  corroboreIdentifiersPredicate,
   corroboreIncludesRelationships,
   corroboreRecordToStore,
   filterGroupToPredicate,
@@ -41,6 +42,22 @@ describe('Corrobore knowledge data provider', () => {
   it('rejects resolved objects before they can become Corrobore point-read identifiers', () => {
     expect(corroboreIdentifier('label--1')).toBe('label--1');
     expect(() => corroboreIdentifier({ internal_id: 'label--1' })).toThrow(/point-read identifier/i);
+  });
+
+  it('resolves OpenCTI identifiers across canonical and STIX alias fields', () => {
+    expect(corroboreIdentifiersPredicate(
+      ['identity--stix-1', 'opencti-internal-1'],
+      ['internal_id', 'standard_id', 'x_opencti_stix_ids', 'i_aliases_ids'],
+    )).toEqual({
+      operator: 'or',
+      arguments: [
+        { operator: 'condition', arguments: { field: 'internal_id', operator: 'in', value: ['identity--stix-1', 'opencti-internal-1'] } },
+        { operator: 'condition', arguments: { field: 'standard_id', operator: 'in', value: ['identity--stix-1', 'opencti-internal-1'] } },
+        { operator: 'condition', arguments: { field: 'x_opencti_stix_ids', operator: 'in', value: ['identity--stix-1', 'opencti-internal-1'] } },
+        { operator: 'condition', arguments: { field: 'i_aliases_ids', operator: 'in', value: ['identity--stix-1', 'opencti-internal-1'] } },
+      ],
+    });
+    expect(() => corroboreIdentifiersPredicate([], ['internal_id'])).toThrow(/at least one identifier/i);
   });
 
   it('preserves relationship index scope for graph reads', () => {
